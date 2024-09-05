@@ -60,6 +60,8 @@ typedef td_err_e (td_ta_event_getmsg_ftype) (const td_thragent_t *ta,
 
 typedef td_err_e (td_thr_get_info_ftype) (const td_thrhandle_t *th,
 					  td_thrinfo_t *infop);
+typedef td_err_e (td_thr_getgregs_ftype) (const td_thrhandle_t *th,
+                                          prgregset_t regset);
 typedef td_err_e (td_thr_event_enable_ftype) (const td_thrhandle_t *th,
 					      int event);
 

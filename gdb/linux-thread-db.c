@@ -48,6 +48,8 @@
 #include "gdbsupport/pathstuff.h"
 #include "valprint.h"
 #include "cli/cli-style.h"
+#include "gregset.h"
+#include <unordered_set>
 
 /* GNU/Linux libthread_db support.
 
@@ -60,9 +62,9 @@
    The libthread_db interface originates on Solaris, where it is both
    more powerful and more complicated.  This implementation only works
    for NPTL, the glibc threading library.  It assumes that each thread
-   is permanently assigned to a single light-weight process (LWP).  At
-   some point it also supported the older LinuxThreads library, but it
-   no longer does.
+   is associated with a single light-weight process (LWP), and that
+   there is at least one thread per LWP.  At some point it also
+   supported the older LinuxThreads library, but it no longer does.
 
    libthread_db-specific information is stored in the "private" field
    of struct thread_info.  When the field is NULL we do not yet have
@@ -72,9 +74,9 @@
 
    Process IDs managed by linux-thread-db.c match those used by
    linux-nat.c: a common PID for all processes, an LWP ID for each
-   thread, and no TID.  We save the TID in private.  Keeping it out
-   of the ptid_t prevents thread IDs changing when libpthread is
-   loaded or unloaded.  */
+   thread, and no TID except for userspace threads.  We save the TID
+   in private.  Keeping it out of the ptid_t prevents thread IDs
+   changing when libpthread is loaded or unloaded.  */
 
 static const target_info thread_db_target_info = {
   "multi-thread",
@@ -102,6 +104,7 @@ public:
 				      CORE_ADDR offset) override;
   const char *extra_thread_info (struct thread_info *) override;
   ptid_t get_ada_task_ptid (long lwp, ULONGEST thread) override;
+  void fetch_registers (struct regcache *, int) override;
 
   thread_info *thread_handle_to_thread_info (const gdb_byte *thread_handle,
 					     int handle_len,
@@ -190,6 +193,10 @@ struct thread_db_info
      be able to ignore such stale entries.  */
   int need_stale_parent_threads_check;
 
+  /* True if we are in M:N threading mode, and td_ta_thr_iter() will
+     need to be asked about user space threads.  */
+  int additional_user_mode_threads_possible;
+
   /* Pointers to the libthread_db functions.  */
 
   td_init_ftype *td_init_p;
@@ -198,6 +205,7 @@ struct thread_db_info
   td_ta_map_lwp2thr_ftype *td_ta_map_lwp2thr_p;
   td_ta_thr_iter_ftype *td_ta_thr_iter_p;
   td_thr_get_info_ftype *td_thr_get_info_p;
+  td_thr_getgregs_ftype *td_thr_getgregs_p;
   td_thr_tls_get_addr_ftype *td_thr_tls_get_addr_p;
   td_thr_tlsbase_ftype *td_thr_tlsbase_p;
 };
@@ -300,6 +308,15 @@ delete_thread_db_info (process_stratum_target *targ, int pid)
   xfree (info);
 }
 
+enum class thread_db_thread_info_type : char
+{
+  only_system_threads = 0,
+  system_thread,
+  user_thread_suspended,
+  user_thread_running,
+  user_thread_running_on_system_thread
+};
+
 /* Use "struct private_thread_info" to cache thread state.  This is
    a substantial optimization.  */
 
@@ -307,6 +324,8 @@ struct thread_db_thread_info : public private_thread_info
 {
   /* Flag set when we see a TD_DEATH event for this thread.  */
   bool dying = false;
+  thread_db_thread_info_type type
+      = thread_db_thread_info_type::only_system_threads;
 
   /* Cached thread state.  */
   td_thrhandle_t th {};
@@ -649,7 +668,9 @@ check_thread_db_callback (const td_thrhandle_t *th, void *arg)
   CHECK (ti.ti_ta_p == th->th_ta_p);
   CHECK (ti.ti_tid == (thread_t) th->th_unique);
 
-  /* Check td_ta_map_lwp2thr.  */
+  /* Check td_ta_map_lwp2thr.  If userspace threads are enabled,
+  it is possible for this userspace thread to have an associated
+  LWP which is running something else.  */
   td_thrhandle_t th2;
   memset (&th2, 23, sizeof (td_thrhandle_t));
   CALL_UNCHECKED (td_ta_map_lwp2thr, th->th_ta_p, ti.ti_lid, &th2);
@@ -665,7 +686,8 @@ check_thread_db_callback (const td_thrhandle_t *th, void *arg)
 
       LOG (" => %s", core_addr_to_string_nz ((CORE_ADDR) th2.th_unique));
 
-      CHECK (memcmp (th, &th2, sizeof (td_thrhandle_t)) == 0);
+      if (tdb_testinfo->info->additional_user_mode_threads_possible == 0)
+        CHECK (memcmp (th, &th2, sizeof (td_thrhandle_t)) == 0);
     }
 
   /* Attempt TLS access.  Assuming errno is TLS, this calls
@@ -796,6 +818,197 @@ check_thread_db (struct thread_db_info *info, bool log_progress)
   return test_passed;
 }
 
+/* State for check_thread_db_has_user_and_system_threads_callback.  */
+
+struct check_thread_db_has_user_and_system_threads_info
+{
+  /* The libthread_db under test.  */
+  struct thread_db_info *info;
+
+  /* True if progress should be logged.  */
+  bool log_progress;
+
+  /* The thread infos.  */
+  std::vector<std::pair<const td_thrhandle_t *, td_thrinfo_t> >
+      user_threads_seen, system_threads_seen;
+
+  /* Name of last libthread_db function called.  */
+  const char *last_call;
+
+  /* Value returned by last libthread_db call.  */
+  td_err_e last_result;
+
+  check_thread_db_has_user_and_system_threads_info ()
+      : info (NULL), log_progress (false), last_call (NULL),
+        last_result (TD_OK)
+  {
+  }
+};
+
+/* Callback for check_thread_db_has_user_and_system_threads.  */
+
+static int
+check_thread_db_has_user_and_system_threads_callback (const td_thrhandle_t *th,
+                                                      void *arg)
+{
+  check_thread_db_has_user_and_system_threads_info *tdb_testinfo
+      = (check_thread_db_has_user_and_system_threads_info *)arg;
+  gdb_assert (tdb_testinfo != NULL);
+
+#define LOG(fmt, args...)                                                     \
+  do                                                                          \
+    {                                                                         \
+      if (tdb_testinfo->log_progress)                                         \
+        {                                                                     \
+          debug_printf (fmt, ##args);                                         \
+          gdb_flush (gdb_stdlog);                                             \
+        }                                                                     \
+    }                                                                         \
+  while (0)
+
+#define CHECK_1(expr, args...)                                                \
+  do                                                                          \
+    {                                                                         \
+      if (!(expr))                                                            \
+        {                                                                     \
+          LOG (" ... FAIL!\n");                                               \
+          error (args);                                                       \
+        }                                                                     \
+    }                                                                         \
+  while (0)
+
+#define CHECK(expr) CHECK_1 (expr, "(%s) == false", #expr)
+
+#define CALL_UNCHECKED(func, args...)                                         \
+  do                                                                          \
+    {                                                                         \
+      tdb_testinfo->last_call = #func;                                        \
+      tdb_testinfo->last_result = tdb_testinfo->info->func##_p (args);        \
+    }                                                                         \
+  while (0)
+
+#define CHECK_CALL()                                                          \
+  CHECK_1 (tdb_testinfo->last_result == TD_OK, _ ("%s failed: %s"),           \
+           tdb_testinfo->last_call,                                           \
+           thread_db_err_str (tdb_testinfo->last_result))
+
+#define CALL(func, args...)                                                   \
+  do                                                                          \
+    {                                                                         \
+      CALL_UNCHECKED (func, args);                                            \
+      CHECK_CALL ();                                                          \
+    }                                                                         \
+  while (0)
+
+  LOG ("  Got thread");
+
+  /* Check td_ta_thr_iter passed consistent arguments.  */
+  CHECK (th != NULL);
+  CHECK (arg == (void *)tdb_testinfo);
+  CHECK (th->th_ta_p == tdb_testinfo->info->thread_agent);
+
+  LOG (" %s", core_addr_to_string_nz ((CORE_ADDR)th->th_unique));
+
+  /* Check td_thr_get_info.  */
+  td_thrinfo_t ti;
+  CALL (td_thr_get_info, th, &ti);
+
+  LOG (" => %d", ti.ti_lid);
+
+  CHECK (ti.ti_ta_p == th->th_ta_p);
+  CHECK (ti.ti_tid == (thread_t)th->th_unique);
+
+  if (ti.ti_type == TD_THR_USER)
+    {
+      tdb_testinfo->user_threads_seen.push_back (std::make_pair (th, ti));
+      LOG (" type = user");
+    }
+  if (ti.ti_type == TD_THR_SYSTEM)
+    {
+      tdb_testinfo->system_threads_seen.push_back (std::make_pair (th, ti));
+      LOG (" type = system");
+    }
+
+  LOG (" ... OK\n");
+
+#undef LOG
+#undef CHECK_1
+#undef CHECK
+#undef CALL_UNCHECKED
+#undef CHECK_CALL
+#undef CALL
+
+  return 0;
+}
+
+static bool
+thread_db_has_user_and_system_threads (struct thread_db_info *info,
+                                       bool log_progress)
+{
+  bool test_passed = true;
+
+  if (log_progress)
+    debug_printf (
+        _ ("Seeing if libthread_db returns a mixture of thread types:\n"));
+
+  gdb_assert (info->td_ta_thr_iter_p != NULL);
+
+  struct check_thread_db_has_user_and_system_threads_info tdb_testinfo_buf;
+  struct check_thread_db_has_user_and_system_threads_info *tdb_testinfo
+      = &tdb_testinfo_buf;
+
+  tdb_testinfo->info = info;
+  tdb_testinfo->log_progress = log_progress;
+
+  try
+    {
+      td_err_e err = info->td_ta_thr_iter_p (
+          info->thread_agent,
+          check_thread_db_has_user_and_system_threads_callback, tdb_testinfo,
+          TD_THR_ANY_STATE, TD_THR_LOWEST_PRIORITY, TD_SIGNO_MASK,
+          TD_THR_ANY_USER_FLAGS);
+
+      if (err != TD_OK)
+        error (_ ("td_ta_thr_iter failed: %s"), thread_db_err_str (err));
+
+      if (tdb_testinfo->user_threads_seen.empty ()
+          && tdb_testinfo->system_threads_seen.empty ())
+        error (_ ("no threads seen"));
+
+      if (tdb_testinfo->system_threads_seen.empty ())
+        test_passed = false;
+    }
+  catch (const gdb_exception_error &except)
+    {
+      if (warning_pre_print)
+        gdb_puts (warning_pre_print, gdb_stderr);
+
+      exception_fprintf (gdb_stderr, except,
+                         _ ("libthread_db integrity checks failed: "));
+
+      test_passed = false;
+    }
+
+  if (test_passed && log_progress)
+    debug_printf (_ ("libthread_db does supply a M:N threading model.\n"));
+
+  if (test_passed)
+    {
+      for (size_t i = 0; i < tdb_testinfo->user_threads_seen.size (); i++)
+        {
+          const td_thrhandle_t *th_p
+              = tdb_testinfo->user_threads_seen[i].first;
+          td_thrinfo_t &ti = tdb_testinfo->user_threads_seen[i].second;
+          ptid_t ptid (info->pid, ti.ti_lid);
+          struct thread_info *tp = info->process_target->find_thread (ptid);
+          if (tp == NULL || tp->priv == NULL)
+            record_thread (info, tp, ptid, th_p, &ti);
+        }
+    }
+
+  return test_passed;
+}
+
 /* Predicate which tests whether objfile OBJ refers to the library
    containing pthread related symbols.  Historically, this library has
    been named in such a way that looking for "libpthread" in the name
@@ -885,24 +1098,12 @@ try_thread_db_load_1 (struct thread_db_info *info)
   CHK (TDB_VERBOSE_DLSYM (info, td_thr_get_info));
 
   /* These are not essential.  */
+  TDB_DLSYM (info, td_thr_getgregs);
   TDB_DLSYM (info, td_thr_tls_get_addr);
   TDB_DLSYM (info, td_thr_tlsbase);
   TDB_DLSYM (info, td_ta_delete);
 
-  /* It's best to avoid td_ta_thr_iter if possible.  That walks data
-     structures in the inferior's address space that may be corrupted,
-     or, if the target is running, may change while we walk them.  If
-     there's execution (and /proc is mounted), then we're already
-     attached to all LWPs.  Use thread_from_lwp, which uses
-     td_ta_map_lwp2thr instead, which does not walk the thread list.
-
-     td_ta_map_lwp2thr uses ps_get_thread_area, but we can't use that
-     currently on core targets, as it uses ptrace directly.  */
-  if (target_has_execution ()
-      && linux_proc_task_list_dir_exists (inferior_ptid.pid ()))
-    info->td_ta_thr_iter_p = NULL;
-  else
-    CHK (TDB_VERBOSE_DLSYM (info, td_ta_thr_iter));
+  CHK (TDB_VERBOSE_DLSYM (info, td_ta_thr_iter));
 
 #undef TDB_VERBOSE_DLSYM
 #undef TDB_DLSYM
@@ -915,7 +1116,22 @@ try_thread_db_load_1 (struct thread_db_info *info)
 	return false;
     }
 
-  if (info->td_ta_thr_iter_p == NULL)
+  /* It's best to avoid td_ta_thr_iter if possible.  That walks data
+     structures in the inferior's address space that may be corrupted,
+     or, if the target is running, may change while we walk them.  If
+     there's execution (and /proc is mounted), then we're already
+     attached to all LWPs.  Use thread_from_lwp, which uses
+     td_ta_map_lwp2thr instead, which does not walk the thread list.
+
+     td_ta_map_lwp2thr uses ps_get_thread_area, but we can't use that
+     currently on core targets, as it uses ptrace directly.
+
+     There is an exception to the above: a custom thread_db may
+     additionally report user space threads in addition to system
+     threads. If that is the case, we will have a M:N threading case.
+     */
+  if (target_has_execution ()
+      && linux_proc_task_list_dir_exists (inferior_ptid.pid ()))
     {
       int pid = inferior_ptid.pid ();
       thread_info *curr_thread = inferior_thread ();
@@ -923,8 +1139,24 @@ try_thread_db_load_1 (struct thread_db_info *info)
       linux_stop_and_wait_all_lwps ();
 
       for (const lwp_info *lp : all_lwps ())
-	if (lp->ptid.pid () == pid)
-	  thread_from_lwp (curr_thread, lp->ptid);
+        if (lp->ptid.pid () == pid)
+          thread_from_lwp (curr_thread, lp->ptid);
+
+      /* If there are threads with the TD_THR_SYSTEM type, we have a
+      M:N threading case. Note that the NPTL thread_db only ever returns
+      TD_THR_USER. */
+      if (thread_db_has_user_and_system_threads (info, libthread_db_debug))
+        {
+          info->additional_user_mode_threads_possible = 1;
+          gdb_printf (_ ("[User and system thread debugging using "
+                         "libthread_db enabled]\n"));
+        }
+      else
+        {
+          info->td_ta_thr_iter_p = NULL; /* no longer use */
+          gdb_printf (_ ("[Thread debugging using libthread_db with proc task "
+                         "list enabled]\n"));
+        }
 
       linux_unstop_all_lwps ();
     }
@@ -935,8 +1167,8 @@ try_thread_db_load_1 (struct thread_db_info *info)
 	 thread_db, and fall back to at least listing LWPs.  */
       return false;
     }
-
-  gdb_printf (_("[Thread debugging using libthread_db enabled]\n"));
+  else
+    gdb_printf (_ ("[Thread debugging using libthread_db enabled]\n"));
 
   if (!libthread_db_search_path.empty () || libthread_db_debug)
     {
@@ -1357,6 +1589,10 @@ record_thread (struct thread_db_info *info,
   /* Construct the thread's private data.  */
   thread_db_thread_info *priv = new thread_db_thread_info;
 
+  if (info->additional_user_mode_threads_possible != 0)
+    priv->type = (ti_p->ti_type == TD_THR_USER)
+                     ? thread_db_thread_info_type::user_thread_suspended
+                     : thread_db_thread_info_type::system_thread;
   priv->th = *th_p;
   priv->tid = ti_p->ti_tid;
   update_thread_state (priv, ti_p);
@@ -1452,7 +1688,10 @@ thread_db_target::follow_exec (inferior *follow_inf, ptid_t ptid,
 struct callback_data
 {
   struct thread_db_info *info;
+  td_thr_state_e state;
   int new_threads;
+
+  std::unordered_set<thread_info *> known_userspace_threads;
 };
 
 static int
@@ -1468,6 +1707,45 @@ find_new_threads_callback (const td_thrhandle_t *th_p, void *data)
   if (err != TD_OK)
     error (_("find_new_threads_callback: cannot get thread info: %s"),
 	   thread_db_err_str (err));
+
+  /* Is this a userspace thread? */
+  if (cb_data->state == TD_THR_RUN && ti.ti_type == TD_THR_USER)
+    {
+      ptid_t ptid (info->pid, ti.ti_lid, ti.ti_tid);
+      tp = info->process_target->find_thread (ptid);
+      if (tp == NULL || tp->priv == NULL)
+        {
+          if (libthread_db_debug)
+            gdb_printf ("find_new_threads_callback: new user space thread "
+                        "recorded with tid %lx\n",
+                        ti.ti_tid);
+          tp = record_thread (info, tp, ptid, th_p, &ti);
+        }
+      else
+        {
+          cb_data->known_userspace_threads.erase (tp);
+        }
+      thread_db_thread_info *priv = get_thread_db_thread_info (tp);
+      priv->type = thread_db_thread_info_type::user_thread_suspended;
+
+      /* Is this currently running on a LWP? */
+      ptid_t ptid2 (info->pid, ti.ti_lid, 0);
+      struct thread_info *tp2 = info->process_target->find_thread (ptid2);
+      if (tp2 != NULL)
+        {
+          thread_db_thread_info *priv2 = get_thread_db_thread_info (tp2);
+          td_thrinfo_t ti2;
+          err = info->td_thr_get_info_p (&priv2->th, &ti2);
+          if (err == TD_OK && ti2.ti_tid == ti.ti_tid)
+            {
+              priv->type = thread_db_thread_info_type::
+                  user_thread_running_on_system_thread;
+              priv2->type = thread_db_thread_info_type::
+                  user_thread_running;
+            }
+        }
+      return 0;
+    }
 
   if (ti.ti_lid == -1)
     {
@@ -1523,13 +1801,30 @@ find_new_threads_callback (const td_thrhandle_t *th_p, void *data)
 
 static int
 find_new_threads_once (struct thread_db_info *info, int iteration,
-		       td_err_e *errp)
+                       bool has_execution, td_err_e *errp)
 {
   struct callback_data data;
   td_err_e err = TD_ERR;
 
   data.info = info;
+  data.state = has_execution ? TD_THR_RUN /* suspended user threads only */
+                             : TD_THR_ANY_STATE;
   data.new_threads = 0;
+
+  if (has_execution)
+    {
+      /* If suspended user threads only, create a list of
+      all user space threads and have those marked off by this iteration.
+      For all those which remain, call set_thread_exited().
+      */
+      for (thread_info *tp : all_threads (info->process_target))
+        {
+          if (tp->ptid.tid () != 0)
+            {
+              data.known_userspace_threads.insert (tp);
+            }
+        }
+    }
 
   /* See comment in thread_db_update_thread_list.  */
   gdb_assert (info->td_ta_thr_iter_p != NULL);
@@ -1537,13 +1832,9 @@ find_new_threads_once (struct thread_db_info *info, int iteration,
   try
     {
       /* Iterate over all user-space threads to discover new threads.  */
-      err = info->td_ta_thr_iter_p (info->thread_agent,
-				    find_new_threads_callback,
-				    &data,
-				    TD_THR_ANY_STATE,
-				    TD_THR_LOWEST_PRIORITY,
-				    TD_SIGNO_MASK,
-				    TD_THR_ANY_USER_FLAGS);
+      err = info->td_ta_thr_iter_p (
+          info->thread_agent, find_new_threads_callback, &data, data.state,
+          TD_THR_LOWEST_PRIORITY, TD_SIGNO_MASK, TD_THR_ANY_USER_FLAGS);
     }
   catch (const gdb_exception_error &except)
     {
@@ -1552,6 +1843,11 @@ find_new_threads_once (struct thread_db_info *info, int iteration,
 	  exception_fprintf (gdb_stdlog, except,
 			     "Warning: find_new_threads_once: ");
 	}
+    }
+
+  for (thread_info *tp : data.known_userspace_threads)
+    {
+      set_thread_exited (tp);
     }
 
   if (libthread_db_debug)
@@ -1591,14 +1887,16 @@ thread_db_find_new_threads_2 (thread_info *stopped, bool until_no_new)
 	 seen that 2 iterations in a row are not always sufficient to
 	 "capture" all threads.  */
       for (i = 0, loop = 0; loop < 4 && err == TD_OK; ++i, ++loop)
-	if (find_new_threads_once (info, i, &err) != 0)
-	  {
+        if (find_new_threads_once (info, i, stopped->inf->has_execution (),
+                                   &err)
+            != 0)
+          {
 	    /* Found some new threads.  Restart the loop from beginning.  */
 	    loop = -1;
 	  }
     }
   else
-    find_new_threads_once (info, 0, &err);
+    find_new_threads_once (info, 0, stopped->inf->has_execution (), &err);
 
   if (err != TD_OK)
     error (_("Cannot find new threads: %s"), thread_db_err_str (err));
@@ -1642,8 +1940,9 @@ thread_db_target::update_thread_list ()
 	 stop.  That uses thread_db entry points that do not walk
 	 libpthread's thread list, so should be safe, as well as more
 	 efficient.  */
-      if (thread->inf->has_execution ())
-	continue;
+      if (thread->inf->has_execution ()
+          && info->additional_user_mode_threads_possible == 0)
+        continue;
 
       thread_db_find_new_threads_1 (thread);
     }
@@ -1661,8 +1960,33 @@ thread_db_target::pid_to_str (ptid_t ptid)
     {
       thread_db_thread_info *priv = get_thread_db_thread_info (thread_info);
 
-      return string_printf ("Thread 0x%lx (LWP %ld)",
-			    (unsigned long) priv->tid, ptid.lwp ());
+      if (priv->type != thread_db_thread_info_type::only_system_threads)
+        {
+          const char *desc = NULL;
+          switch (priv->type)
+            {
+            case thread_db_thread_info_type::
+                user_thread_running_on_system_thread:
+              return string_printf ("Thread 0x%lx u_lwp  (LWP %ld)",
+                                    (unsigned long)priv->tid, ptid.lwp ());
+            case thread_db_thread_info_type::system_thread:
+              desc = "system";
+              break;
+            case thread_db_thread_info_type::user_thread_suspended:
+              desc = "u_susp";
+              break;
+            case thread_db_thread_info_type::user_thread_running:
+              desc = "u_run ";
+              break;
+            }
+          return string_printf ("Thread 0x%lx %s (LWP %ld)",
+                                (unsigned long)priv->tid, desc, ptid.lwp ());
+        }
+      else
+        {
+          return string_printf ("Thread 0x%lx (LWP %ld)",
+                                (unsigned long)priv->tid, ptid.lwp ());
+        }
     }
 
   return beneath ()->pid_to_str (ptid);
@@ -1833,8 +2157,63 @@ thread_db_target::get_ada_task_ptid (long lwp, ULONGEST thread)
 }
 
 void
+thread_db_target::fetch_registers (struct regcache *regcache, int regnum)
+{
+  ptid_t ptid = regcache->ptid ();
+
+  if (ptid.tid () == 0)
+    {
+      /* It's an LWP; pass the request on to the layer beneath.  */
+      beneath ()->fetch_registers (regcache, regnum);
+      return;
+    }
+
+  thread_info *tp = current_inferior ()->find_thread (ptid);
+  if (tp == NULL || tp->priv == NULL)
+    {
+      regcache->raw_supply (regnum, NULL);
+      return;
+    }
+  struct thread_db_info *info = get_thread_db_info (
+      as_process_stratum_target (this->beneath ()), ptid.pid ());
+  thread_db_thread_info *priv = get_thread_db_thread_info (tp);
+  prgregset_t gregset{};
+  td_err_e err = info->td_thr_getgregs_p (&priv->th, gregset);
+  if (err == TD_PARTIALREG)
+    {
+      // User space thread is running right now on its LWP
+      beneath ()->fetch_registers (regcache, regnum);
+      return;
+    }
+  if (err == TD_NOTHR)
+    {
+      set_thread_exited (tp);
+      return;
+    }
+  if (err != TD_OK)
+    {
+      gdb_printf (
+          "fetch_registers: fetching register %d for tid %lx failed with %d\n",
+          regnum, ptid.tid (), err);
+      regcache->raw_supply (regnum, NULL);
+      return;
+    }
+
+  supply_gregset (regcache, (gdb_gregset_t *)gregset);
+
+  if (libthread_db_debug)
+    {
+      gdb_printf ("fetch_registers: fetched register %d for tid %lx\n", regnum,
+                  ptid.tid ());
+    }
+}
+
+void
 thread_db_target::resume (ptid_t ptid, int step, enum gdb_signal signo)
 {
+  if (ptid.tid () != 0)
+    return;
+
   process_stratum_target *beneath
     = as_process_stratum_target (this->beneath ());
 

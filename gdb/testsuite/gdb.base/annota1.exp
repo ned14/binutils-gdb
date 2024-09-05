@@ -136,7 +136,7 @@ set reading_re \
     "Reading \[^\r\n\]+\r\n"
 set libthread_db_re \
     [multi_line \
-	 "\\\[Thread debugging using libthread_db enabled\\\]" \
+	 "\\\[Thread debugging using libthread_db\[^\r\n\]+enabled\\\]" \
 	 "Using host libthread_db library \[^\r\n\]+\r\n"]
 
 set optional_re \

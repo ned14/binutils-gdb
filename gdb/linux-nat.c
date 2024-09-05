@@ -1765,6 +1765,12 @@ linux_nat_target::resume (ptid_t scope_ptid, int step, enum gdb_signal signo)
 			   ? strsignal (gdb_signal_to_host (signo)) : "0"),
 			  inferior_ptid.to_string ().c_str ());
 
+  if (scope_ptid.tid () != 0)
+    {
+      linux_nat_debug_printf ("   ... not resuming as is userspace thread");
+      return;
+    }
+
   /* Mark the lwps we're resuming as resumed and update their
      last_resume_kind to resume_continue.  */
   iterate_over_lwps (scope_ptid, resume_set_callback);
@@ -4514,6 +4520,15 @@ void
 linux_nat_target::stop (ptid_t ptid)
 {
   LINUX_NAT_SCOPED_DEBUG_ENTER_EXIT;
+  if (ptid.tid () != 0)
+    {
+      linux_nat_debug_printf ("[%s] userspace thread is already stopped",
+                              ptid.to_string ().c_str ());
+      thread_info *tp = linux_target->find_thread (ptid);
+      gdb_assert (tp != NULL);
+      tp->set_executing (false);
+      return;
+    }
   iterate_over_lwps (ptid, linux_nat_stop_lwp);
 }
 

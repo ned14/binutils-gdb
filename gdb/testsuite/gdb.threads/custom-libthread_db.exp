@@ -1,0 +1,124 @@
+# Copyright 2011-2024 Free Software Foundation, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+# The exclusion of targets not x64 and not aarch64 is due to lack of
+# platform specific code in the test. The test could be very easily
+# extended for other platforms.
+require isnative allow_shlib_tests {is_any_target "aarch64*-*-*" "x86_64-*-*"}
+if {![istarget *-linux*]} {
+    return 0
+}
+
+standard_testfile
+set shlib_path [standard_output_file libthread_db.so.1]
+set shlib_dir [file dirname $shlib_path]
+
+if { [gdb_compile_shlib $srcdir/$subdir/${testfile}-shlib.c $shlib_path {debug}] != "" } {
+    return
+}
+
+if { [prepare_for_testing "failed to prepare" $testfile $srcfile ] } {
+    return -1
+}
+
+gdb_test "set auto-load safe-path /" ".*" "enable loading custom libthread_db"
+
+gdb_test "set libthread-db-search-path ${shlib_dir}" ".*" "custom libthread-db set"
+
+gdb_breakpoint "main"
+gdb_run_cmd
+if {[gdb_test_sequence "" "check our custom libthread_db has been detected as a M:N threading model" {
+    "\\[User and system thread debugging using libthread_db enabled\\]"
+   }] != 0} {
+    return -1
+}
+
+gdb_test_sequence "maint check libthread-db" \
+"libpthread.so fully initialized" {
+    "\[\r\n\]+Running libthread_db integrity checks:"
+    "\[\r\n\]+\[ \]+Got thread 0x\[1-9a-f\]\[0-9a-f\]+ => \[0-9\]+ => 0x\[1-9a-f\]\[0-9a-f\]+; errno = 0 ... OK"
+    "\[\r\n\]+libthread_db integrity checks passed."
+}
+#gdb_test "set debug libthread-db 1" ".*" "turn custom libthread-db debugging on"
+#gdb_test "set debug linux-nat 1" ".*" "turn LWP debugging on"
+#gdb_test "set debug infrun 1" ".*" "turn infrun debugging on"
+#gdb_test "set debug infcall 1" ".*" "turn infcall debugging on"
+#gdb_test "set debug threads 1" ".*" "turn threads debugging on"
+
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 1"]"
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 2"]"
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 3"]"
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 4"]"
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 5"]"
+gdb_breakpoint "$srcfile:[gdb_get_line_number "break here 6"]"
+
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*" "threads at start of main"
+
+gdb_test "continue" ".*" "continue after main"
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*\r\n  2\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_susp \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*" "threads before switch to user thread"
+
+gdb_test "continue" ".*" "switch into user thread"
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_run  \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*\r\n  2\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_lwp  \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*" "threads within user thread"
+
+gdb_test "bt" "#0  user_thread .*" "backtrace within user thread"
+
+gdb_test "print n" "\\\$1 = 0\[^\r\n\]*" "print n within user thread"
+
+gdb_test "continue" ".*" "switch out of user thread"
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*\r\n  2\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_susp \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*" "threads at middle of main"
+
+gdb_test "bt" "#0  main \\\(\\\) .*" "backtrace system thread before switch"
+
+gdb_test "thread 2" ".*" "switch to user thread"
+
+gdb_test_sequence "maint check libthread-db" \
+"libpthread.so still passes integrity tests" {
+    "\[\r\n\]+Running libthread_db integrity checks:"
+    "\[\r\n\]+\[ \]+Got thread 0x\[1-9a-f\]\[0-9a-f\]+ => \[0-9\]+ => 0x\[1-9a-f\]\[0-9a-f\]+; errno = 0 ... OK"
+    "\[\r\n\]+libthread_db integrity checks passed."
+}
+
+gdb_test "bt" "#0  0x\[^ \]+ in user_thread .*" "backtrace user thread after switch"
+
+gdb_test "print n" "\\\$2 = 0\[^\r\n\]*" "print n after switch"
+
+gdb_test "thread 1" ".*" "switch to system thread"
+
+gdb_test "bt" "#0  main \\\(\\\) .*" "backtrace system thread after switch"
+
+gdb_test "continue" ".*" "do another loop of user thread"
+
+gdb_test "thread 2" ".*" "switch to user thread second loop"
+
+gdb_test "print n" "\\\$3 = 1\[^\r\n\]*" "print n after second switch"
+
+gdb_test "info threads" "  1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*\r\n\\\* 2\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_susp \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*" "threads before we destroy and recreate user thread"
+
+gdb_test "continue" ".*" "destroy and recreate user thread"
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*\r\n  3\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ u_susp \\\(LWP \[^\r\n\]* user_thread \\\(\[^\r\n\]*" "threads after we recreate user thread"
+
+gdb_test "continue" ".*" "destroy user thread"
+
+gdb_test "info threads" "\\\* 1\[\t \]*Thread 0x\[1-9a-f\]\[0-9a-f\]+ system \\\(LWP \[^\r\n\]* main \\\(\\\) at \[^\r\n\]*" "threads at end of main"
+
+gdb_test "continue" "exited normally.*" "continue to end"
+
+

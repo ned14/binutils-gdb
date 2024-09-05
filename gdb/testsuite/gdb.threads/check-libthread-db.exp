@@ -98,7 +98,7 @@ with_test_prefix "automated load-time check" {
 		 "\[\r\n\]+Running libthread_db integrity checks:" \
 		 "\[\r\n\]+\[ \]+Got thread $initial_thread_re ... OK" \
 		 "\[\r\n\]+libthread_db integrity checks passed." \
-		 "\[\r\n\]+\\\[Thread debugging using libthread_db enabled\\\]"]
+		 "\[\r\n\]+\\\[Thread debugging using libthread_db\[^\r\n\]+enabled\\\]"]
     }
 
     # Automated load-time check with NPTL fully operational.
@@ -118,7 +118,7 @@ with_test_prefix "automated load-time check" {
 		    "\[\r\n\]+\[ \]+Got thread 0x\[1-9a-f\]\[0-9a-f\]+ => \[0-9\]+ => 0x\[1-9a-f\]\[0-9a-f\]+ ... OK"
 		    "\[\r\n\]+\[ \]+Got thread 0x\[1-9a-f\]\[0-9a-f\]+ => \[0-9\]+ => 0x\[1-9a-f\]\[0-9a-f\]+ ... OK"
 		    "\[\r\n\]+libthread_db integrity checks passed."
-		    "\[\r\n\]+[Thread debugging using libthread_db enabled]"
+		    "\[\r\n\]+\\\[Thread debugging using libthread_db\[^\r\n\]+enabled\\\]"
 		}
 
 	    gdb_exit
